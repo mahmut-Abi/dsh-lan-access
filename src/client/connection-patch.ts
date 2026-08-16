@@ -40,8 +40,10 @@ function isServedLanHostname(hostname: string): boolean {
 
 /** Mint one rpc id (the plugin's bundle installs the randomUUID polyfill). */
 function mintRpcId(): string {
-  const uuid = globalThis.crypto?.randomUUID
-  if (typeof uuid === 'function') return uuid()
+  const cryptoObj = globalThis.crypto
+  const uuid = cryptoObj?.randomUUID
+  // randomUUID must be invoked with the Crypto instance as `this`.
+  if (typeof uuid === 'function') return uuid.call(cryptoObj)
   return `lan-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
