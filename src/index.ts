@@ -621,6 +621,8 @@ export function apply(ctx: Context): void {
   } satisfies LanAccessBindService)
   // The owner scope, once the settings child fiber registers the namespace.
   let scope: SettingsScope<LanAccessSettings> | undefined
+  // Client boot diagnostics (the last few browser reports; debug aid).
+  const diagReports: Array<{ at: number; data: unknown }> = []
   // Serialized bind application: concurrent toggles queue; the chain stays
   // fulfilled so one failure cannot strand later writes.
   let applying: Promise<void> = Promise.resolve()
@@ -739,6 +741,34 @@ export function apply(ctx: Context): void {
         })
       },
     }), 'dsh-lan-access: /lan-access/rpc route')
+
+    // Client boot diagnostics: browsers POST their ledger state after boot;
+    // GET reads the last reports (debug aid for LAN settings issues).
+    httpCtx.effect(() => httpCtx.webServer.register({
+      kind: 'exact',
+      path: '/lan-access/diag',
+      handler: (req, res) => {
+        void (async () => {
+          if (!isTrustedApiRequest(req, trustedHostsOf(loader))) {
+            writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'request origin is not trusted' } })
+            return
+          }
+          if (req.method === 'POST') {
+            const body = await readJsonBody(req)
+            diagReports.push({ at: Date.now(), data: body })
+            if (diagReports.length > 20) diagReports.shift()
+            writeJson(res, 200, { ok: true })
+            return
+          }
+          writeJson(res, 200, { ok: true, value: diagReports })
+        })().catch((error: unknown) => {
+          writeJson(res, 500, {
+            ok: false,
+            error: { code: 'internal', message: error instanceof Error ? error.message : String(error) },
+          })
+        })
+      },
+    }), 'dsh-lan-access: /lan-access/diag route')
     align()
   })
 

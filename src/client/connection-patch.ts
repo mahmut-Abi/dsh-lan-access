@@ -86,6 +86,14 @@ export function installConnectionPatch(connection: LanAccessConnectionHandle): (
   }
 
   const originalIsLoopback = connection.isLoopback
+  // Diagnostics marker: lets the /lan-access/diag report verify the patch ran.
+  try {
+    Object.defineProperty(connection, '__lanAccessPatched', {
+      configurable: true,
+      writable: true,
+      value: true,
+    })
+  } catch { /* non-fatal */ }
   try {
     Object.defineProperty(connection, 'isLoopback', {
       configurable: true,

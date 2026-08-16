@@ -32,6 +32,8 @@ export interface LanAccessSlotsService {
   }, component: unknown): () => void
   /** Run a callback for each declaration lifetime of a slot (no-op while undeclared). */
   inject(key: string, callback: () => () => void): () => void
+  /** Entries registered into a slot (diagnostics use). */
+  entries(key: string): unknown[]
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -93,5 +95,30 @@ export function apply(ctx: Context): void {
       order: 15,
       inject: (): LanAccessRowInjected => ({}),
     }, LanAccessRow))
+
+    // Boot diagnostics (debug aid): report the settings slot ledger state so
+    // the host's /lan-access/diag can show whether the plugins page's section,
+    // tab, and card registrations landed in this browser.
+    const report = (): void => {
+      const count = (key: string): number => uiCtx.slots.entries(key).length
+      void fetch('/lan-access/diag', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          slots: {
+            'settings.section': count('settings.section'),
+            'settings.general.item': count('settings.general.item'),
+            'settings.plugins.tab': count('settings.plugins.tab'),
+            'settings.plugin.item': count('settings.plugin.item'),
+          },
+          isLoopback: connection?.isLoopback === true,
+          patched: (connection as { __lanAccessPatched?: boolean } | undefined)?.__lanAccessPatched === true,
+        }),
+      }).catch(() => {})
+    }
+    // First report at boot; a second after a short delay (registrations that
+    // depend on late service arrivals settle within a second).
+    report()
+    setTimeout(report, 1500)
   })
 }
