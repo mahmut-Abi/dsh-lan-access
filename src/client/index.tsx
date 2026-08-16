@@ -120,5 +120,25 @@ export function apply(ctx: Context): void {
     // depend on late service arrivals settle within a second).
     report()
     setTimeout(report, 1500)
+
+    // Scope probe: bind the same 'shell' namespace the Plugins page's Shell
+    // card uses and report the resulting scope status — 'ready' means the
+    // host-mode + proxy path works end to end in this browser; 'loading' or
+    // 'unavailable' pinpoints where it does not.
+    const settingsScope = ctx.get('settingsScope') as {
+      bind<T>(spec: { namespace: string }): {
+        getSnapshot(): { status: string; value?: T }
+      }
+    } | undefined
+    if (settingsScope !== undefined) {
+      const probe = settingsScope.bind<Record<string, unknown>>({ namespace: 'shell' })
+      setTimeout(() => {
+        void fetch('/lan-access/diag', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ scopeProbe: probe.getSnapshot() }),
+        }).catch(() => {})
+      }, 2500)
+    }
   })
 }
