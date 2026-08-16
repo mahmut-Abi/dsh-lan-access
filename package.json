@@ -1,6 +1,6 @@
 {
   "name": "dsh-lan-access",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH web plugin: a General-settings toggle that binds the web GUI to all interfaces (LAN access) or back to loopback",
   "type": "module",
   "license": "MIT",
@@ -36,9 +36,8 @@
       "patch": "./cordis.patch.yml"
     },
     "client": {
-      "inject": [
-        "@deepseek-ai/dsh-client-connection"
-      ],
+      "inject": [],
+      "immediately": true,
       "platform": "web"
     }
   },

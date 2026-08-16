@@ -88,9 +88,14 @@ modification of the DSH checkout**:
   Language/Appearance rows therefore work remotely.
 - **The client `settingsScope` degrades to memory mode on non-loopback
   origins** (surfaces render empty). The browser bundle widens
-  `connection.isLoopback` to "loopback OR served LAN authority" at runtime
-  (it injects only `connection`, so the patch lands in the first boot wave,
-  before any settings surface binds).
+  `connection.isLoopback` to "loopback OR served LAN authority" at runtime.
+  The client entry is inject-less and marked `dsh.client.immediately`, so
+  its bundle is prefetched and its apply runs in the first boot wave — before
+  any settings surface bundle finishes fetching — guaranteeing the patch is
+  in place before the Plugins cards, Models page, and preference rows bind
+  their scopes. (Without that ordering, a surface that binds early sees the
+  unpatched `isLoopback` and its scope stays memory-mode: the plugin
+  configuration cards render nothing.)
 - **`crypto.randomUUID` does not exist on plain-HTTP LAN origins.** The
   bundle installs a `getRandomValues`-based polyfill (same CSPRNG).
 
@@ -99,6 +104,18 @@ plugin): `host.pickDirectory` / `host.openPath` (native dialogs and host
 file opens) and `llm.discoverModels` (the Models page "discover" button).
 The workspace's own add/browse flow does not need them, and chat file
 opens route into the sidebar editor.
+
+## Debug aids
+
+The host exposes `GET /lan-access/diag` (fenced like the other routes) with
+the latest browser boot reports: slot-registration counts, whether the
+connection patch is active, and a `settingsScope` probe bound to the
+`shell` namespace (status `ready` proves the host-mode + proxy path works
+end to end). During the first minute after boot the browser also posts a
+2-second poll of the Plugins cards' own injected snapshots (`available`
+flags), the slot ledger view, and the declared spec — the exact data that
+separates "cards gone", "cards abdicated", and "cards present but rendering
+null" when a Settings page misbehaves on a remote machine.
 
 ## Optional: dsh-better-sidebar compatibility patch
 

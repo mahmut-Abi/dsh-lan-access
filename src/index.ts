@@ -583,6 +583,7 @@ async function handleRpc(
   loader: LanAccessLoader,
   req: IncomingMessage,
   res: ServerResponse,
+  log?: (method: string, ok: boolean, code?: string, ns?: string, namespaces?: string[]) => void,
 ): Promise<void> {
   if (!isTrustedApiRequest(req, trustedHostsOf(loader))) {
     writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'request origin is not trusted' } })
@@ -600,6 +601,19 @@ async function handleRpc(
   }
   const rpcId = typeof record.rpcId === 'string' ? record.rpcId : 'lan-access'
   const response = await dispatchLanAccessRpc(ctx, record.method, { rpcId, ...(record.payload as object) })
+  if (log !== undefined) {
+    const ns = (record.payload as { ns?: unknown } | null)?.ns
+    const namespaces = response.result.ok
+      ? (response.result.value as { namespaces?: Array<{ ns: unknown }> } | null)?.namespaces?.map(view => String(view.ns))
+      : undefined
+    log(
+      record.method,
+      response.result.ok,
+      response.result.ok ? undefined : response.result.error.code,
+      typeof ns === 'string' ? ns : undefined,
+      namespaces,
+    )
+  }
   writeJson(res, 200, response)
 }
 
@@ -623,6 +637,12 @@ export function apply(ctx: Context): void {
   let scope: SettingsScope<LanAccessSettings> | undefined
   // Client boot diagnostics (the last few browser reports; debug aid).
   const diagReports: Array<{ at: number; data: unknown }> = []
+  // RPC traffic log (the last 60 proxied calls; debug aid).
+  const rpcTraffic: Array<{ at: number; method: string; ok: boolean; code?: string; ns?: string; namespaces?: string[] }> = []
+  const logRpc = (method: string, ok: boolean, code?: string, ns?: string, namespaces?: string[]): void => {
+    rpcTraffic.push({ at: Date.now(), method, ok, code, ns, namespaces })
+    if (rpcTraffic.length > 60) rpcTraffic.shift()
+  }
   // Serialized bind application: concurrent toggles queue; the chain stays
   // fulfilled so one failure cannot strand later writes.
   let applying: Promise<void> = Promise.resolve()
@@ -733,7 +753,7 @@ export function apply(ctx: Context): void {
       kind: 'exact',
       path: '/lan-access/rpc',
       handler: (req, res) => {
-        void handleRpc(ctx, loader, req, res).catch((error: unknown) => {
+        void handleRpc(ctx, loader, req, res, (method, ok, code, ns, namespaces) => logRpc(method, ok, code, ns, namespaces)).catch((error: unknown) => {
           writeJson(res, 500, {
             ok: false,
             error: { code: 'internal', message: error instanceof Error ? error.message : String(error) },
@@ -760,7 +780,7 @@ export function apply(ctx: Context): void {
             writeJson(res, 200, { ok: true })
             return
           }
-          writeJson(res, 200, { ok: true, value: diagReports })
+          writeJson(res, 200, { ok: true, value: { reports: diagReports, traffic: rpcTraffic } })
         })().catch((error: unknown) => {
           writeJson(res, 500, {
             ok: false,

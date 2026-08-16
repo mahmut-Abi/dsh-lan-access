@@ -51,32 +51,52 @@ declare module '@deepseek-ai/cordis' {
 installRandomUUIDPolyfill()
 
 /**
- * Services required before mounting: ONLY `connection` — provided in the
- * first boot wave, before the settings surfaces (which wait on `remote` /
- * `settingsScope`) bind. The settings row itself is mounted from a child
- * fiber once slots + locale exist.
+ * Services required before mounting: NONE — an inject-less row starts in the
+ * first boot wave, so this plugin's apply runs before the settings surfaces
+ * (which wait on `remote` / `settingsScope`) bind their scopes. The
+ * connection handle is read lazily via `ctx.get` (it exists by then: the
+ * connection row is inject-less too and precedes this row in the tree). The
+ * settings row itself is mounted from a child fiber once slots + locale
+ * exist.
  */
-export const inject = ['connection']
+export const inject: string[] = []
 
 /**
  * Client plugin body.
- * @param ctx - the client cordis context (connection injected; slots/locale via child fiber).
+ * @param ctx - the client cordis context (slots/locale via child fiber).
  */
 export function apply(ctx: Context): void {
   // Defensive re-install (module scope already ran; tests may mount directly).
   installRandomUUIDPolyfill()
   // The connection patch: served-authority classification + settings/
-  // credentials RPC routing. Runs in the first boot wave, so every settings
-  // consumer that binds later sees the patched behavior. Disposed with this
-  // fiber (HMR-safe).
-  const connection = ctx.get('connection')
-  if (connection !== undefined) {
-    ctx.effect(() => installConnectionPatch(connection), 'dsh-lan-access: connection patch')
-  }
+  // credentials RPC routing. This fiber is inject-less and marked
+  // immediately in package.json, so it starts in the first boot wave, before
+  // any settings surface fetches; the effect still waits for the connection
+  // service defensively (entry creation is concurrent, so the connection row
+  // is not guaranteed to have applied yet at this fiber's start). Disposed
+  // with this fiber (HMR-safe).
+  ctx.effect(async function* () {
+    let connection: LanAccessConnectionHandle | undefined
+    for (let attempt = 0; attempt < 600 && connection === undefined; attempt += 1) {
+      try {
+        connection = ctx.get('connection') as LanAccessConnectionHandle | undefined
+      } catch {
+        // The connection row has not provided the service yet; retry shortly.
+      }
+      if (connection === undefined) await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    if (connection === undefined) return
+    yield installConnectionPatch(connection)
+  }, 'dsh-lan-access: connection patch')
 
   // The settings row + dictionaries need slots/locale, which arrive later;
   // mount them in a child fiber that waits for those services.
   ctx.inject(['slots', 'locale'], (uiCtx) => {
+    // The connection handle for the diagnostics below (the connection row has
+    // long applied by the time this child fiber runs; keep it defensive).
+    let connection: LanAccessConnectionHandle | undefined
+    try { connection = ctx.get('connection') as LanAccessConnectionHandle | undefined } catch { /* not yet */ }
+
     // Follow the DSH i18n system: register the plugin's dictionaries into the
     // shared locale registry; the row re-renders on locale switches through
     // the bound service. Disposers run on fiber disposal (HMR-safe).
@@ -132,15 +152,64 @@ export function apply(ctx: Context): void {
         getSnapshot(): { status: string; value?: T }
       }
     } | undefined
+    let probe: { getSnapshot(): { status: string } } | undefined
     if (settingsScope !== undefined) {
-      const probe = settingsScope.bind<Record<string, unknown>>({ namespace: 'shell' })
+      probe = settingsScope.bind<Record<string, unknown>>({ namespace: 'shell' })
       setTimeout(() => {
         void fetch('/lan-access/diag', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ scopeProbe: probe.getSnapshot() }),
+          body: JSON.stringify({ scopeProbe: probe?.getSnapshot() }),
         }).catch(() => {})
       }, 2500)
     }
+
+    // Render-path poll (debug aid): every 2s, report what the OUTLET would
+    // see for the plugin-item slot — raw entries, shadowing winners, the
+    // declared spec, and each card's own injected snapshot (the card renders
+    // nothing while `available` is false). Correlating this with the DOM
+    // decides between "entries/spec gone", "cards abdicated", and
+    // "cards present but rendering null".
+    const wideSlots = uiCtx.slots as LanAccessSlotsService & {
+      entriesOfSlot?(key: string): Array<{ options?: { id?: string } }>
+      specDynamic?(key: string): { kind?: string; scope?: string } | undefined
+    }
+    const cardFace = (entry: { options?: { id?: string }; inject?: () => unknown }): unknown => {
+      try {
+        const face = entry.inject?.() as Record<string, unknown> | undefined
+        const hooks = face?.hooks as Record<string, { getSnapshot(): unknown }> | undefined
+        const hook = hooks !== undefined ? Object.values(hooks)[0] : undefined
+        return hook?.getSnapshot() ?? null
+      } catch (error) {
+        return { threw: String(error) }
+      }
+    }
+    const poll = (): void => {
+      const entries = wideSlots.entries('settings.plugin.item') as Array<{ options?: { id?: string }; inject?: () => unknown }>
+      const cardEntries = entries.map(entry => ({
+        id: entry.options?.id ?? '?',
+        state: cardFace(entry),
+      }))
+      void fetch('/lan-access/diag', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          poll: {
+            entries: entries.map(entry => entry.options?.id ?? '?'),
+            entriesOfSlot: (wideSlots.entriesOfSlot?.('settings.plugin.item') ?? []).map(entry => entry.options?.id ?? '?'),
+            spec: wideSlots.specDynamic?.('settings.plugin.item') ?? null,
+            cards: cardEntries,
+            isLoopback: connection?.isLoopback === true,
+            patched: (connection as { __lanAccessPatched?: boolean } | undefined)?.__lanAccessPatched === true,
+            probe: probe?.getSnapshot?.() ?? null,
+          },
+        }),
+      }).catch(() => {})
+    }
+    const pollStop = setInterval(poll, 2000)
+    poll()
+    // Bound the chatter: the poll is a boot-time debug aid, not a live metric.
+    setTimeout(() => { clearInterval(pollStop) }, 60000)
+    uiCtx.effect(() => () => { clearInterval(pollStop) }, 'dsh-lan-access: diag poll')
   })
 }
