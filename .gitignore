@@ -1,0 +1,6 @@
+node_modules/
+*.tsbuildinfo
+# NOTE: lib/ is committed on purpose — the plugin is installed from GitHub
+# without a build step, so the built host half and browser bundle ship with
+# the repo. Rebuild with: pnpm build
+

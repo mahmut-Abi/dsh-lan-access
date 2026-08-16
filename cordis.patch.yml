@@ -1,0 +1,27 @@
+# dsh-lan-access bundle patch
+#
+# This file is the `dsh.bundle.patch` layer of the package: when installed
+# through the official CLI —
+#
+#   dsh plugin --profile web add link:/path/to/dsh-intranet-access-plugin
+#
+# — the command appends `dsh-lan-access` to `dsh.profile.bundles` and the
+# profile boot merges THIS patch (an insert of the host row plus a webserver
+# config override) like any manual cordis.patch.yml mount line.
+
+# The host row.
+- insert:
+    - id: lan-access
+      name: 'dsh-lan-access'
+
+# The webserver bind host follows the plugin's persisted setting. This row
+# overrides the bundle default (loopback) with an expression that reads the
+# live `lanAccess` service provided by the plugin — every webserver fiber
+# (re)start evaluates it, so a post-boot user-patch re-apply converges to the
+# same host instead of reverting to loopback. The port keeps its original
+# expression. Both keys are restated because a patch row replaces the target
+# row's whole config. Drop this row to pin the bind in a later patch layer.
+- id: webserver
+  config:
+    host: !!js ctx.get('lanAccess')?.host ?? '127.0.0.1'
+    port: !!js ctx.webStartup.port ?? 3080

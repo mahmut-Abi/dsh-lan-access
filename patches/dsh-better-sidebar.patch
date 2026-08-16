@@ -1,0 +1,30 @@
+diff --git a/lib/index.js b/lib/index.js
+index 249ab11fd1ba8a6a5bf4f07c28a3e844cb3559a8..697c7696a88dfc4b14b8468c106b1c3a7827a723 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -2010,7 +2010,14 @@ function mediaTypeForPath(path) {
+ }
+ /** The connection row's resolved trustedHosts (live read; the /api fence's own list). */
+ function trustedHostsOf(ctx) {
+-	for (const entry of ctx.loader.entries()) if (entry.options.name === "connection") return entry.options.config?.trustedHosts ?? [];
++	for (const entry of ctx.loader.entries()) {
++		if (entry.options.name !== "@deepseek-ai/dsh-client-connection") continue;
++		const fiberTrusted = entry.fiber?.config?.trustedHosts;
++		if (Array.isArray(fiberTrusted)) return fiberTrusted;
++		const raw = entry.options.config?.trustedHosts;
++		if (Array.isArray(raw)) return raw;
++		return [];
++	}
+ 	return [];
+ }
+ /**
+@@ -2277,8 +2284,7 @@ function buildApi(ctx, ptyManager, agentPtyRegistry, resolved, getSettings) {
+ function apply(ctx, config) {
+ 	ensureSpawnHelper();
+ 	const resolved = resolveSidebarConfig(config);
+-	const trustedHosts = trustedHostsOf(ctx);
+-	const fence = (req) => isTrustedApiRequest(req, trustedHosts);
++	const fence = (req) => isTrustedApiRequest(req, trustedHostsOf(ctx));
+ 	const ptyManager = new PtyManager(defaultShell(), resolved.terminalsPerSession);
+ 	const agentPtyRegistry = new AgentPtyRegistry(defaultShell());
+ 	let settingsFace;
