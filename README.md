@@ -73,32 +73,47 @@ fence all ship inside the plugin.
      enabled: true
    ```
 
-## Optional compatibility patches (fully working GUI from LAN)
+## Remote Settings pages and workspace — no harness change needed
 
-The plugin itself is self-contained, but a few *pre-existing* DSH ecosystem
-gates also block LAN browsers and live outside the plugin's own code. The
-repo ships the fixes as ready-made patches with one installer:
+Everything the plugin serves works from a LAN browser with **zero
+modification of the DSH checkout**:
+
+- **The /api gateway pins the configuration plane (`settings.*`,
+  `credentials.*`) to loopback.** The plugin mirrors those domains on its
+  own fenced route (`/lan-access/rpc`) — same exposure boundary (model
+  providers + web/product namespaces), redacted values, revision-fenced
+  writes, same error codes — and the browser bundle routes the shared
+  `api.settings.*` / `api.credentials.*` calls through it. The Models page
+  provider directory, the Plugins configuration cards, and the
+  Language/Appearance rows therefore work remotely.
+- **The client `settingsScope` degrades to memory mode on non-loopback
+  origins** (surfaces render empty). The browser bundle widens
+  `connection.isLoopback` to "loopback OR served LAN authority" at runtime
+  (it injects only `connection`, so the patch lands in the first boot wave,
+  before any settings surface binds).
+- **`crypto.randomUUID` does not exist on plain-HTTP LAN origins.** The
+  bundle installs a `getRandomValues`-based polyfill (same CSPRNG).
+
+Remaining loopback-only (hardcoded in the harness, not patchable from a
+plugin): `host.pickDirectory` / `host.openPath` (native dialogs and host
+file opens) and `llm.discoverModels` (the Models page "discover" button).
+The workspace's own add/browse flow does not need them, and chat file
+opens route into the sidebar editor.
+
+## Optional: dsh-better-sidebar compatibility patch
+
+dsh-better-sidebar's trust fence matched the connection row by the wrong
+name and read the raw `!!js` config, so its panels (explorer / editor /
+terminal / git) only ever accepted loopback. The repo ships the fix as a
+profile-level pnpm patch (no harness change):
 
 ```sh
-./scripts/install-patches.sh web                          # better-sidebar fence fix
-./scripts/install-patches.sh web /path/to/deepseek-harness # + optional harness patches
+./scripts/install-patches.sh web
 ```
 
-| Tier | Patch | Fixes | When you need it |
-| --- | --- | --- | --- |
-| 2 | `patches/dsh-better-sidebar.patch` | dsh-better-sidebar's trust fence matched the connection row by the wrong name and read the raw `!!js` config, so its panels (explorer / editor / terminal / git) only ever accepted loopback. The pnpm patch matches `@deepseek-ai/dsh-client-connection` and reads the fiber's resolved `trustedHosts` per request. | You use [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) and want its panels from a LAN machine. |
-| 3 | `patches/harness-connection-trustedHostPrivileged.patch` + `patches/harness-connection-lan-served-origin.patch` | (a) The /api gateway pins the whole configuration plane (`settings.*`, `credentials.*`, `llm.discoverModels`, `host.pickDirectory`, `host.openPath`) to loopback even on trusted-host deployments — the opt-in `trustedHostPrivileged` config relaxes exactly the methods you list. (b) The browser connection treats a page loaded from a non-loopback IP literal as a served authority, so the Settings surfaces (Models, Plugins, Language, Appearance, …) use host-backed persistence instead of silently degrading to empty. | You want the remote Settings pages and host actions to work from LAN browsers. Without them, the Models page errors with "HTTP 403" and the Plugins page stays empty. |
-
-Tier 2 is applied to the profile itself (a pnpm patch, like any
-`patchedDependencies`). Tier 3 modifies the DSH dev checkout: the installer
-applies every `patches/harness-*.patch` with `git apply`, runs the
-harness's own `pnpm run build:lib:client` build, and prints the
-connection-row override to add to the profile's `cordis.patch.yml`
-(restate `trustedHosts`; drop `trustedHostPrivileged` to restore the
-loopback-only pin). Without the Tier-3 patches the extra config key is
-ignored harmlessly. The harness patches are generated against the
-`0.1.0-rc.5` checkout they were developed on; on a different DSH version,
-`git apply` may fail and the small hunks are trivial to re-apply by hand.
+This copies `patches/dsh-better-sidebar.patch` into the profile's
+`patches/` directory, registers it under `patchedDependencies` in
+`pnpm-workspace.yaml`, and runs `pnpm install`.
 
 ## Security notes
 

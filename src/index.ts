@@ -25,7 +25,10 @@
 import { execFile } from 'node:child_process'
 import { networkInterfaces } from 'node:os'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { settingsNamespace, type SettingsScope } from '@deepseek-ai/dsh-settings'
+import {
+  SettingsConflictError, settingsNamespace, type SettingsScope,
+} from '@deepseek-ai/dsh-settings'
+import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 
@@ -341,6 +344,266 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
   }
 }
 
+/* ── settings/credentials RPC proxy ───────────────────────────────────────
+   The /api gateway pins the whole configuration plane (settings.*,
+   credentials.*) to loopback even on trusted-host deployments. For a
+   LAN-served GUI this plugin mirrors the settings + credentials domains on
+   its own fenced route (/lan-access/rpc) so the remote Settings surfaces
+   (Models provider directory, Plugins cards, Language/Appearance rows)
+   work. The proxy reuses the same exposure boundary as the /api gateway:
+   model-provider namespaces plus the web/product allowlist, redacted
+   values, revision-fenced writes, and the same error codes. It is not a
+   bypass — the route sits behind the identical browser-trust fence. */
+
+/** Web-surface settings namespaces the /api proxy exposes (its allowlist mirror). */
+const WEB_SETTINGS_NAMESPACES = [
+  'agent-loop', 'shell', 'locale', 'permission', 'ui-conversation', 'ui-theme', 'web-search-deepseek',
+] as const
+
+/** Product-owned settings namespaces (the api-proxy's product allowlist mirror). */
+const PRODUCT_SETTINGS_NAMESPACES = ['ui-onboarding', 'agent-presets'] as const
+
+/** The llm service face used to enumerate configurable provider namespaces. */
+interface LanAccessLlmService {
+  listConfigurableProviders(): Array<{ settingsNs: string }>
+}
+
+/** The settings seam face (structural subset of SettingsProvider). */
+interface LanAccessSettingsSeam {
+  readonly writable: boolean
+  readonly documentPath?: string
+  describe(options?: { redactSecrets?: boolean }): unknown[]
+  update(ns: string, patch: object, expectedRevision?: number): Promise<void>
+  replace(ns: string, section: object, expectedRevision?: number): Promise<void>
+  mutate(ns: string, ops: readonly unknown[], expectedRevision?: number): Promise<void>
+  prepareDocument(): Promise<string | undefined>
+}
+
+/** Open one path with the OS default application (Finder/Explorer/xdg-open). */
+function openWithSystem(path: string): void {
+  if (process.platform === 'darwin') {
+    execFile('open', [path], { timeout: 5000 }, () => {})
+  } else if (process.platform === 'linux') {
+    execFile('xdg-open', [path], { timeout: 5000 }, () => {})
+  } else {
+    execFile('cmd', ['/c', 'start', '', path], { timeout: 5000 }, () => {})
+  }
+}
+
+/** The credentials seam face (structural subset of CredentialProvider). */
+interface LanAccessCredentialsSeam {
+  describe(ref: string): Promise<{ configured: boolean; source?: string; writable: boolean }>
+  set(ref: string, value: string): Promise<void>
+  unset(ref: string): Promise<void>
+}
+
+/** One RPC result envelope (mirror of the /api RpcResult wire form). */
+type LanAccessRpcResult =
+  | { ok: true; value: unknown }
+  | { ok: false; error: { code: string; message: string; details: Record<string, unknown> } }
+
+/** One RPC response envelope; rpcId echoes the request. */
+interface LanAccessRpcResponse {
+  rpcId: string
+  result: LanAccessRpcResult
+}
+
+function rpcOk(rpcId: string, value: unknown): LanAccessRpcResponse {
+  return { rpcId, result: { ok: true, value } }
+}
+
+function rpcErr(
+  rpcId: string,
+  code: string,
+  message: string,
+  details: Record<string, unknown> = {},
+): LanAccessRpcResponse {
+  return { rpcId, result: { ok: false, error: { code, message, details } } }
+}
+
+/** The settings namespaces this proxy serves — the api-proxy exposure mirror. */
+function exposedSettingsNamespaces(ctx: Context): Set<string> {
+  const exposed = new Set<string>(WEB_SETTINGS_NAMESPACES)
+  for (const ns of PRODUCT_SETTINGS_NAMESPACES) exposed.add(ns)
+  const llm = ctx.get('llm') as LanAccessLlmService | undefined
+  for (const entry of llm?.listConfigurableProviders() ?? []) exposed.add(entry.settingsNs)
+  return exposed
+}
+
+/** Map one redacted settings descriptor to its wire view (api-proxy namespaceView mirror). */
+function namespaceViewOf(descriptor: {
+  ns: unknown
+  schema: unknown
+  value: unknown
+  base?: unknown
+  user?: unknown
+  applies: string
+  revision: number
+  secrets?: Array<{ path: readonly string[]; set: boolean }>
+}): Record<string, unknown> {
+  return {
+    ns: String(descriptor.ns),
+    schema: descriptor.schema,
+    value: descriptor.value,
+    ...descriptor.base === undefined ? {} : { base: descriptor.base },
+    ...descriptor.user === undefined ? {} : { user: descriptor.user },
+    applies: descriptor.applies,
+    secrets: (descriptor.secrets ?? []).map(secret => ({ path: [...secret.path], set: secret.set })),
+    revision: descriptor.revision,
+  }
+}
+
+/** settings.update/replace/mutate with the api-proxy exposure + error mapping. */
+async function settingsWriteRpc(
+  ctx: Context,
+  rpcId: string,
+  ns: string,
+  mode: 'update' | 'replace' | 'mutate',
+  section: unknown,
+  expectedRevision?: number,
+): Promise<LanAccessRpcResponse> {
+  const settings = ctx.get('settings') as LanAccessSettingsSeam | undefined
+  if (settings === undefined) return rpcErr(rpcId, 'internal', 'settings service is absent')
+  if (!exposedSettingsNamespaces(ctx).has(ns)) {
+    return rpcErr(rpcId, 'settings-not-exposed', `settings namespace "${ns}" is not exposed to configuration clients`)
+  }
+  let branded: ReturnType<typeof settingsNamespace>
+  try {
+    branded = settingsNamespace(ns)
+  } catch (error: unknown) {
+    return rpcErr(rpcId, 'settings-rejected', error instanceof Error ? error.message : String(error))
+  }
+  try {
+    if (mode === 'update') await settings.update(branded, section as object, expectedRevision)
+    else if (mode === 'replace') await settings.replace(branded, section as object, expectedRevision)
+    else await settings.mutate(branded, section as readonly unknown[], expectedRevision)
+  } catch (error: unknown) {
+    if (error instanceof SettingsConflictError) {
+      return rpcErr(rpcId, 'settings-conflict', error.message, {
+        ns, expected: error.expected, actual: error.actual,
+      })
+    }
+    return rpcErr(rpcId, 'settings-rejected', error instanceof Error ? error.message : String(error))
+  }
+  const descriptor = (settings.describe({ redactSecrets: true }) as Array<{ ns: unknown }>).find(candidate => String(candidate.ns) === ns)
+  if (descriptor === undefined) {
+    return rpcErr(rpcId, 'internal', `settings namespace "${ns}" was disposed after the ${mode}`)
+  }
+  return rpcOk(rpcId, namespaceViewOf(descriptor as Parameters<typeof namespaceViewOf>[0]))
+}
+
+/** Dispatch one proxied settings/credentials method (mirror of the /api domains). */
+async function dispatchLanAccessRpc(ctx: Context, method: string, payload: unknown): Promise<LanAccessRpcResponse> {
+  const record = (payload ?? {}) as Record<string, unknown>
+  const rpcId = typeof record.rpcId === 'string' ? record.rpcId : 'lan-access'
+  switch (method) {
+    case 'settings.describe': {
+      const settings = ctx.get('settings') as LanAccessSettingsSeam | undefined
+      if (settings === undefined) return rpcErr(rpcId, 'internal', 'settings service is absent')
+      const exposed = exposedSettingsNamespaces(ctx)
+      return rpcOk(rpcId, {
+        writable: settings.writable,
+        hasDocument: settings.documentPath !== undefined,
+        namespaces: (settings.describe({ redactSecrets: true }) as Parameters<typeof namespaceViewOf>[0][])
+          .filter(descriptor => exposed.has(String(descriptor.ns)))
+          .map(namespaceViewOf),
+      })
+    }
+    case 'settings.update':
+    case 'settings.replace':
+    case 'settings.mutate': {
+      const ns = record.ns
+      if (typeof ns !== 'string') return rpcErr(rpcId, 'bad-request', 'expected a string "ns"')
+      const expectedRevision = typeof record.expectedRevision === 'number' ? record.expectedRevision : undefined
+      const section = method === 'settings.update' ? record.patch : method === 'settings.replace' ? record.section : record.ops
+      return settingsWriteRpc(ctx, rpcId, ns, method.slice('settings.'.length) as 'update' | 'replace' | 'mutate', section, expectedRevision)
+    }
+    case 'settings.openDocument': {
+      const settings = ctx.get('settings') as LanAccessSettingsSeam | undefined
+      if (settings === undefined) return rpcErr(rpcId, 'internal', 'settings service is absent')
+      let path: string | undefined
+      try {
+        path = await settings.prepareDocument()
+      } catch (error: unknown) {
+        return rpcErr(rpcId, 'internal', `settings document preparation failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      if (path === undefined) return rpcErr(rpcId, 'internal', 'settings provider has no local document to open')
+      openWithSystem(path)
+      return rpcOk(rpcId, { opened: true })
+    }
+    case 'credentials.describe': {
+      const credentials = ctx.get('credentials') as LanAccessCredentialsSeam | undefined
+      if (credentials === undefined) return rpcErr(rpcId, 'internal', 'credentials service is absent')
+      const refs = record.refs
+      if (!Array.isArray(refs) || refs.some(ref => typeof ref !== 'string')) {
+        return rpcErr(rpcId, 'bad-request', 'expected an array of string refs')
+      }
+      const entries: Record<string, unknown> = {}
+      for (const ref of refs as string[]) {
+        try {
+          const info = await credentials.describe(credentialRef(ref))
+          entries[ref] = {
+            configured: info.configured,
+            ...info.source === undefined ? {} : { source: info.source },
+            writable: info.writable,
+          }
+        } catch (error: unknown) {
+          return rpcErr(rpcId, 'credential-rejected', error instanceof Error ? error.message : String(error), { ref })
+        }
+      }
+      return rpcOk(rpcId, { credentials: entries })
+    }
+    case 'credentials.set':
+    case 'credentials.unset': {
+      const credentials = ctx.get('credentials') as LanAccessCredentialsSeam | undefined
+      if (credentials === undefined) return rpcErr(rpcId, 'internal', 'credentials service is absent')
+      const ref = record.ref
+      if (typeof ref !== 'string') return rpcErr(rpcId, 'bad-request', 'expected a string "ref"')
+      try {
+        if (method === 'credentials.set') {
+          const value = record.value
+          if (typeof value !== 'string') return rpcErr(rpcId, 'bad-request', 'expected a string "value"')
+          await credentials.set(credentialRef(ref), value)
+        } else {
+          await credentials.unset(credentialRef(ref))
+        }
+      } catch (error: unknown) {
+        return rpcErr(rpcId, 'credential-rejected', error instanceof Error ? error.message : String(error), { ref })
+      }
+      return rpcOk(rpcId, {})
+    }
+    default:
+      return rpcErr(rpcId, 'not-found', `unknown lan-access rpc method "${method}"`)
+  }
+}
+
+/** The /lan-access/rpc route handler: fenced, POST-only, envelope-mirroring. */
+async function handleRpc(
+  ctx: Context,
+  loader: LanAccessLoader,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (!isTrustedApiRequest(req, trustedHostsOf(loader))) {
+    writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'request origin is not trusted' } })
+    return
+  }
+  if (req.method !== 'POST') {
+    writeJson(res, 405, { ok: false, error: { code: 'method-error', message: 'method not allowed' } })
+    return
+  }
+  const body = await readJsonBody(req)
+  const record = (body ?? {}) as Record<string, unknown>
+  if (typeof record.method !== 'string' || typeof record.payload !== 'object' || record.payload === null) {
+    writeJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'expected {"method", "payload"}' } })
+    return
+  }
+  const rpcId = typeof record.rpcId === 'string' ? record.rpcId : 'lan-access'
+  const response = await dispatchLanAccessRpc(ctx, record.method, { rpcId, ...(record.payload as object) })
+  writeJson(res, 200, response)
+}
+
+
 /**
  * Mount the LAN-access controller.
  * @param ctx - host context (loader injected).
@@ -461,6 +724,21 @@ export function apply(ctx: Context): void {
         })
       },
     }), 'dsh-lan-access: /lan-access route')
+
+    // The settings/credentials RPC proxy (mirrors the loopback-pinned /api
+    // configuration plane for LAN-served pages; same fence, same envelopes).
+    httpCtx.effect(() => httpCtx.webServer.register({
+      kind: 'exact',
+      path: '/lan-access/rpc',
+      handler: (req, res) => {
+        void handleRpc(ctx, loader, req, res).catch((error: unknown) => {
+          writeJson(res, 500, {
+            ok: false,
+            error: { code: 'internal', message: error instanceof Error ? error.message : String(error) },
+          })
+        })
+      },
+    }), 'dsh-lan-access: /lan-access/rpc route')
     align()
   })
 

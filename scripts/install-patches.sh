@@ -1,29 +1,23 @@
 #!/usr/bin/env bash
-# install-patches.sh — apply the optional compatibility patches this plugin
+# install-patches.sh — apply the optional compatibility patch this plugin
 # ships with, so a LAN-served DSH GUI works from other machines.
 #
+# The plugin itself needs NO harness modification: LAN access, the remote
+# Settings pages (Models/Plugins provider directory, credentials), and the
+# workspace are all served through the plugin's own fenced routes and a
+# runtime connection patch. This script only fixes dsh-better-sidebar's
+# pre-existing trust-fence bug (a profile-level pnpm patch, not a harness
+# change).
+#
 # Usage:
-#   ./scripts/install-patches.sh [profile] [harness-checkout]
+#   ./scripts/install-patches.sh [profile]
 #
-#   profile          DSH profile name (default: web)
-#   harness-checkout Optional absolute path of a deepseek-harness dev checkout.
-#                    When given, the OPTIONAL harness patches are applied
-#                    there and the patched packages are rebuilt. Without
-#                    them, the remote Settings/workspace pages cannot work.
-#
-# What it does:
-#   1. dsh-better-sidebar LAN-fence patch (only if better-sidebar is installed
-#      in the profile): fixes the sidebar's trust fence so its explorer /
-#      editor / terminal panels accept trusted LAN hosts.
-#   2. [optional] harness patches: the /api privileged-method relaxation
-#      (trustedHostPrivileged) and the LAN-served-origin classification that
-#      lets remote browsers use the Settings pages, then rebuilds.
+#   profile   DSH profile name (default: web)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROFILE="${1:-web}"
-HARNESS="${2:-}"
 
 HOME_DIR="${DSH_HOME:-$HOME/.dsh}"
 PROFILE_DIR="$HOME_DIR/profiles/$PROFILE"
@@ -68,48 +62,6 @@ print('    registered in pnpm-workspace.yaml')
 PYEOF
   echo "==> Applying the patch (pnpm install)"
   (cd "$PROFILE_DIR" && pnpm install)
-fi
-
-# ── Tier 3 (optional): harness patches (LAN-served GUI) ───────────────────
-if [ -n "$HARNESS" ]; then
-  if [ ! -d "$HARNESS/packages/client/connection" ]; then
-    echo "error: harness checkout not found: $HARNESS" >&2
-    exit 1
-  fi
-  for PATCH_NAME in "$REPO_DIR"/patches/harness-*.patch; do
-    BASE="$(basename "$PATCH_NAME")"
-    echo "==> Applying $BASE to $HARNESS"
-    cp "$PATCH_NAME" "$HARNESS/$BASE"
-    (cd "$HARNESS" && git apply --check "$BASE" && git apply "$BASE")
-    rm -f "$HARNESS/$BASE"
-  done
-  echo "==> Rebuilding the patched packages (this runs the harness's own client build pass)"
-  (cd "$HARNESS" && pnpm run build:lib:client)
-  cat <<'EOF'
-
-==> Add this connection-row override to $PROFILE_DIR/cordis.patch.yml
-    (restating trustedHosts is required; drop trustedHostPrivileged to keep
-    the loopback-only pin). The list below relaxes the whole configuration
-    plane so the remote Settings pages (Models, Plugins) and workspace host
-    actions work from LAN browsers; requests still must pass the
-    trusted-host fence:
-
-    - id: connection
-      config:
-        trustedHosts: !!js ctx.webRuntime.trustedHosts
-        trustedHostPrivileged:
-          - settings.describe
-          - settings.openDocument
-          - settings.update
-          - settings.replace
-          - settings.mutate
-          - credentials.describe
-          - credentials.set
-          - credentials.unset
-          - llm.discoverModels
-          - host.pickDirectory
-          - host.openPath
-EOF
 fi
 
 echo "==> Done. Restart 'dsh web' (or your usual GUI command) to load the changes."
