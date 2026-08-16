@@ -73,33 +73,32 @@ fence all ship inside the plugin.
      enabled: true
    ```
 
-## Optional compatibility patches (fully working workspace from LAN)
+## Optional compatibility patches (fully working GUI from LAN)
 
-The plugin itself is self-contained, but two *pre-existing* DSH ecosystem
+The plugin itself is self-contained, but a few *pre-existing* DSH ecosystem
 gates also block LAN browsers and live outside the plugin's own code. The
-repo ships both fixes as ready-made patches with one installer:
+repo ships the fixes as ready-made patches with one installer:
 
 ```sh
 ./scripts/install-patches.sh web                          # better-sidebar fence fix
-./scripts/install-patches.sh web /path/to/deepseek-harness # + optional harness patch
+./scripts/install-patches.sh web /path/to/deepseek-harness # + optional harness patches
 ```
 
 | Tier | Patch | Fixes | When you need it |
 | --- | --- | --- | --- |
 | 2 | `patches/dsh-better-sidebar.patch` | dsh-better-sidebar's trust fence matched the connection row by the wrong name and read the raw `!!js` config, so its panels (explorer / editor / terminal / git) only ever accepted loopback. The pnpm patch matches `@deepseek-ai/dsh-client-connection` and reads the fiber's resolved `trustedHosts` per request. | You use [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) and want its panels from a LAN machine. |
-| 3 | `patches/harness-connection-trustedHostPrivileged.patch` | The /api gateway pins `host.pickDirectory` and `host.openPath` to loopback even on trusted-host deployments (a deliberate no-authentication boundary). The patch adds an opt-in `trustedHostPrivileged` config to `packages/client/connection` and rebuilds it. | You want LAN browsers to open paths in host apps / use the native directory chooser. Optional: the workspace's own add/browse flow does not need it. |
+| 3 | `patches/harness-connection-trustedHostPrivileged.patch` + `patches/harness-connection-lan-served-origin.patch` | (a) The /api gateway pins the whole configuration plane (`settings.*`, `credentials.*`, `llm.discoverModels`, `host.pickDirectory`, `host.openPath`) to loopback even on trusted-host deployments — the opt-in `trustedHostPrivileged` config relaxes exactly the methods you list. (b) The browser connection treats a page loaded from a non-loopback IP literal as a served authority, so the Settings surfaces (Models, Plugins, Language, Appearance, …) use host-backed persistence instead of silently degrading to empty. | You want the remote Settings pages and host actions to work from LAN browsers. Without them, the Models page errors with "HTTP 403" and the Plugins page stays empty. |
 
 Tier 2 is applied to the profile itself (a pnpm patch, like any
-`patchedDependencies`). Tier 3 modifies the DSH dev checkout: it applies
-with `git apply`, runs the harness's own `pnpm run build:lib:client` build,
-and then asks you to add the connection-row override (the installer prints
-it; restate `trustedHosts`, drop `trustedHostPrivileged` to restore the
-pin). Without the Tier-3 harness patch the extra config key is ignored
-harmlessly, so the two tiers can be installed independently. The harness
-patch is generated against the `0.1.0-rc.5` checkout it was developed on;
-on a different DSH version, `git apply` may fail and the two small hunks
-(Config field + the `privileged` set in `apply`) are trivial to re-apply by
-hand.
+`patchedDependencies`). Tier 3 modifies the DSH dev checkout: the installer
+applies every `patches/harness-*.patch` with `git apply`, runs the
+harness's own `pnpm run build:lib:client` build, and prints the
+connection-row override to add to the profile's `cordis.patch.yml`
+(restate `trustedHosts`; drop `trustedHostPrivileged` to restore the
+loopback-only pin). Without the Tier-3 patches the extra config key is
+ignored harmlessly. The harness patches are generated against the
+`0.1.0-rc.5` checkout they were developed on; on a different DSH version,
+`git apply` may fail and the small hunks are trivial to re-apply by hand.
 
 ## Security notes
 
