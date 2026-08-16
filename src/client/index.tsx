@@ -113,6 +113,8 @@ export function apply(ctx: Context): void {
           },
           isLoopback: connection?.isLoopback === true,
           patched: (connection as { __lanAccessPatched?: boolean } | undefined)?.__lanAccessPatched === true,
+          origin: typeof location !== 'undefined' ? location.origin : 'no-location',
+          ua: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 100) : 'no-navigator',
         }),
       }).catch(() => {})
     }
