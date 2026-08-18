@@ -30,12 +30,22 @@ interface RpcResponseEnvelope {
 /** The plugin's fenced RPC route. */
 const RPC_PATH = '/lan-access/rpc'
 
-/** Whether a WHATWG hostname is a non-loopback IPv4 literal (the served-LAN case). */
+/**
+ * Whether a WHATWG hostname is a served (non-loopback) authority. This is the
+ * client-side twin of the server's browser-trust fence: the page only runs
+ * this code because the DSH webserver itself served it, and the server fence
+ * refuses unknown Hosts — so any non-loopback hostname that served this page
+ * (an IPv4 LAN literal, a DNS name, a Tailscale name, ...) is a served
+ * authority. Covers plain-HTTP LAN access and HTTPS via a reverse proxy
+ * (IP or hostname).
+ */
 function isServedLanHostname(hostname: string): boolean {
+  if (hostname === '' || hostname === 'localhost' || hostname === '[::1]') return false
   const parts = hostname.split('.')
-  if (parts.length !== 4) return false
-  if (!parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)) return false
-  return parts[0] !== '127'
+  if (parts.length === 4 && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)) {
+    return parts[0] !== '127'
+  }
+  return true
 }
 
 /** Mint one rpc id (the plugin's bundle installs the randomUUID polyfill). */
