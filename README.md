@@ -9,6 +9,18 @@ webserver override:
   so the browser on a LAN machine works fully (chat, tools, workspace).
 - **Off** — the GUI binds `127.0.0.1` again (loopback only — the safe default).
 
+## Screenshots
+
+The DSH web GUI opened from another machine on the same network
+(`http://192.168.0.101:3080`):
+
+![DSH web GUI opened over LAN](assets/lan-access-gui.png)
+
+The **LAN access** toggle in Settings → General, showing the address other
+devices can open:
+
+![Settings → General LAN access toggle](assets/lan-access-settings.png)
+
 ## How it works
 
 | Half | File | Role |
