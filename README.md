@@ -4,6 +4,8 @@ A DeepSeek Harness web plugin that adds a **LAN access** toggle to the DSH
 Settings shell (Settings → General). It replaces the manual `cordis.patch.yml`
 webserver override:
 
+> **Tested with [DeepSeek Harness](https://github.com/deepseek-harness/deepseek-harness) `v0.1.1-rc.1`** — this plugin is verified runnable against that harness version.
+
 - **On** — the web GUI binds `0.0.0.0`, so other machines on the same network
   can open it at `http://<LAN-IP>:3080`. The /api trust fence is updated live,
   so the browser on a LAN machine works fully (chat, tools, workspace).
