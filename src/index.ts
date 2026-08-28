@@ -867,6 +867,7 @@ export function apply(ctx: Context): void {
   // fulfilled so one failure cannot strand later writes.
   let applying: Promise<void> = Promise.resolve()
   let pendingCount = 0
+  let queuedApply: { enabled: boolean; task: Promise<void> } | undefined
 
   const serverOf = (): LanAccessWebServer | undefined =>
     ctx.get('webServer') as LanAccessWebServer | undefined
@@ -913,23 +914,31 @@ export function apply(ctx: Context): void {
 
   /** Queue one bind convergence and keep the connection trust list in sync. */
   const enqueueApply = (enabled: boolean): Promise<void> => {
+    if (queuedApply?.enabled === enabled) return queuedApply.task
     pendingCount += 1
-    const task = applying.then(async () => {
-      const server = serverOf()
-      if (server === undefined) return
-      const desiredHost: LanAccessHost = enabled ? '0.0.0.0' : '127.0.0.1'
-      if (server.host !== desiredHost) {
-        const entry = webserverEntry()
-        if (entry === undefined) {
-          throw new Error('webserver loader entry not found')
+    const queued = {
+      enabled,
+      task: applying.then(async () => {
+        const server = serverOf()
+        if (server === undefined) return
+        const desiredHost: LanAccessHost = enabled ? '0.0.0.0' : '127.0.0.1'
+        if (server.host !== desiredHost) {
+          const entry = webserverEntry()
+          if (entry === undefined) {
+            throw new Error('webserver loader entry not found')
+          }
+          await loader.update(entry.id, { config: { host: desiredHost, port: server.port } })
         }
-        await loader.update(entry.id, { config: { host: desiredHost, port: server.port } })
-      }
-      await updateConnectionTrustedHosts(enabled)
-    })
-    applying = task.catch(() => {})
-    void task.finally(() => { pendingCount -= 1 }).catch(() => {})
-    return task
+        await updateConnectionTrustedHosts(enabled)
+      }),
+    }
+    queuedApply = queued
+    applying = queued.task.catch(() => {})
+    void queued.task.finally(() => {
+      pendingCount -= 1
+      if (queuedApply === queued) queuedApply = undefined
+    }).catch(() => {})
+    return queued.task
   }
 
   /** Converge the webserver bind to the persisted setting once both sides exist. */
