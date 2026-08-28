@@ -663,6 +663,14 @@ export function apply(ctx: Context): void {
     return undefined
   }
 
+  /** Find the connection loader entry by plugin name. */
+  const connectionEntry = (): LanAccessLoaderEntry | undefined => {
+    for (const entry of loader.entries()) {
+      if (entry.options.name === CONNECTION_ROW) return entry
+    }
+    return undefined
+  }
+
   /** Queue one bind convergence; no-ops when the webserver already binds the desired host. */
   const enqueueApply = (enabled: boolean): Promise<void> => {
     pendingCount += 1
@@ -675,15 +683,25 @@ export function apply(ctx: Context): void {
       if (entry === undefined) {
         throw new Error('webserver loader entry not found')
       }
-      // Restate the webserver row config (host + the current port) to force
-      // the fiber restart: the loader rebinds the socket and reloads every
-      // dependent row (web-runtime re-samples LAN trust, the connection row
-      // re-reads it into the /api fence). The row's composed `host`
-      // expression (this plugin's bundle patch) is what any later
-      // recomposition re-applies, and it reads the live `lanAccess` service
-      // — so a post-boot user-patch re-apply converges to the SAME persisted
-      // host instead of reverting to the bundle default.
       await loader.update(entry.id, { config: { host: desiredHost, port: server.port } })
+
+      // After rebinding to 0.0.0.0, patch the connection row's trustedHosts
+      // to include every LAN address. The upstream resolveLanTrust skips LAN
+      // detection when the server initially binds loopback, so the cascade
+      // alone never populates the list. Writing the resolved addresses into
+      // the connection config forces the /api fence to admit LAN clients.
+      if (enabled) {
+        const addresses = lanAddresses()
+        const connEntry = connectionEntry()
+        if (connEntry !== undefined) {
+          const currentConfig = (connEntry.options.config ?? {}) as Record<string, unknown>
+          const currentHosts = Array.isArray(currentConfig.trustedHosts)
+            ? currentConfig.trustedHosts as string[]
+            : []
+          const merged = [...new Set([...currentHosts, ...addresses])]
+          await loader.update(connEntry.id, { config: { ...currentConfig, trustedHosts: merged } })
+        }
+      }
     })
     applying = task.catch(() => {})
     void task.finally(() => { pendingCount -= 1 }).catch(() => {})
