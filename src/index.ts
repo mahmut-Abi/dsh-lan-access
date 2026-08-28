@@ -25,9 +25,7 @@
 import { execFile } from 'node:child_process'
 import { networkInterfaces } from 'node:os'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import {
-  SettingsConflictError, settingsNamespace, type SettingsScope,
-} from '@deepseek-ai/dsh-settings'
+import { SettingsConflictError, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
@@ -130,8 +128,8 @@ export interface LanAccessBindService {
 /** Stable Cordis plugin name (the loader row mounts this package). */
 export const name = 'dsh-lan-access'
 
-/** Services required before mounting: the loader tree (for the webserver row and the connection row's trusted hosts). */
-export const inject = ['loader']
+/** Services required before mounting: settings for the persisted flag and loader for row updates. */
+export const inject = ['loader', 'settings']
 
 /** The webserver row's plugin name (matched by name — its entry id is group-prefixed). */
 const WEBSERVER_PLUGIN = '@deepseek-ai/dsh-host-webserver'
@@ -844,17 +842,17 @@ async function handleRpc(
  */
 export function apply(ctx: Context): void {
   const loader = ctx.loader
+  const ns = settingsNamespace(LAN_ACCESS_NAMESPACE)
+  const scope = ctx.settings.register<LanAccessSettings>(ns, LanAccessSchema)
   // The live bind-host source for the webserver row's `host` expression
   // (`!!js ctx.get('lanAccess')?.host ?? '127.0.0.1'`, composed by this
-  // plugin's bundle patch). Provided by this fiber, which depends only on the
-  // loader, so it survives every webserver restart.
+  // plugin's bundle patch). The bundle also makes the webserver row inject this
+  // service, so the first server start reads the persisted setting.
   ctx.provide('lanAccess', {
     get host(): LanAccessHost {
-      return scope?.get().enabled === true ? '0.0.0.0' : '127.0.0.1'
+      return scope.get().enabled === true ? '0.0.0.0' : '127.0.0.1'
     },
   } satisfies LanAccessBindService)
-  // The owner scope, once the settings child fiber registers the namespace.
-  let scope: SettingsScope<LanAccessSettings> | undefined
   // Client boot diagnostics (the last few browser reports; debug aid).
   const diagReports: Array<{ at: number; data: unknown }> = []
   // RPC traffic log (the last 60 proxied calls; debug aid).
@@ -908,7 +906,7 @@ export function apply(ctx: Context): void {
 
   const routeTrustedHosts = (): string[] => {
     const configured = trustedHostsOf(loader)
-    if (scope?.get().enabled !== true && serverOf()?.host !== '0.0.0.0') return configured
+    if (scope.get().enabled !== true && serverOf()?.host !== '0.0.0.0') return configured
     return [...new Set([...configured, ...lanAddresses()])]
   }
 
@@ -943,17 +941,17 @@ export function apply(ctx: Context): void {
 
   /** Converge the webserver bind to the persisted setting once both sides exist. */
   const align = (): void => {
-    if (scope === undefined || serverOf() === undefined) return
+    if (serverOf() === undefined) return
     void enqueueApply(scope.get().enabled).catch(error => warn('align', error))
   }
 
   const stateOf = async (): Promise<LanAccessState> => {
     const server = serverOf()
-    const enabled = scope?.get().enabled ?? false
+    const enabled = scope.get().enabled
     const addresses = enabled ? lanAddresses() : []
     const primary = enabled ? await primaryLanAddress() : undefined
     return {
-      ready: scope !== undefined && server !== undefined,
+      ready: server !== undefined,
       enabled,
       host: server?.host ?? null,
       port: server?.port ?? null,
@@ -965,17 +963,12 @@ export function apply(ctx: Context): void {
     }
   }
 
-  // The durable section: register the namespace, follow every commit, and
-  // align at boot. This child fiber depends on the settings seam only, so a
-  // webserver restart never tears it down.
-  ctx.inject(['settings'], (sctx) => {
-    const ns = settingsNamespace(LAN_ACCESS_NAMESPACE)
-    scope = sctx.settings.register<LanAccessSettings>(ns, LanAccessSchema)
-    scope.watch((next) => {
-      void enqueueApply(next.enabled).catch(error => warn('settings change', error))
-    })
-    align()
+  // The durable section: follow every commit and align at boot. This plugin
+  // fiber is independent of the webserver, so a rebind never tears it down.
+  scope.watch((next) => {
+    void enqueueApply(next.enabled).catch(error => warn('settings change', error))
   })
+  align()
 
   // The fenced route + boot alignment. This child fiber reloads after a
   // rebind (the webserver service disappears and returns), re-registering
@@ -1084,7 +1077,7 @@ export function apply(ctx: Context): void {
       }
       const enabled = (payload as { enabled: boolean }).enabled
       const settings = ctx.get('settings')
-      if (settings === undefined || scope === undefined) {
+      if (settings === undefined) {
         throw new LanAccessHttpError('not-ready', 'LAN access settings are not ready yet', 503)
       }
       // Persist first (the commit fires the watch → enqueueApply), then make

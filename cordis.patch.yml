@@ -14,14 +14,16 @@
     - id: lan-access
       name: 'dsh-lan-access'
 
-# The webserver bind host follows the plugin's persisted setting. This row
-# overrides the bundle default (loopback) with an expression that reads the
-# live `lanAccess` service provided by the plugin — every webserver fiber
-# (re)start evaluates it, so a post-boot user-patch re-apply converges to the
-# same host instead of reverting to loopback. The port keeps its original
-# expression. Both keys are restated because a patch row replaces the target
-# row's whole config. Drop this row to pin the bind in a later patch layer.
+# The webserver bind host follows the plugin's persisted setting. The row
+# waits for the `lanAccess` service before the first bind, so enabled profiles
+# do not start on loopback and then restart to all interfaces. The port keeps
+# its original expression. Both keys are restated because a patch row replaces
+# the target row's whole config. Drop this row to pin the bind in a later patch
+# layer.
 - id: webserver
+  inject:
+    - webStartup
+    - lanAccess
   config:
     host: !!js ctx.get('lanAccess')?.host ?? '127.0.0.1'
     port: !!js ctx.webStartup.port ?? 3080
