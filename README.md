@@ -100,6 +100,14 @@ modification of the DSH checkout**:
   `api.settings.*` / `api.credentials.*` calls through it. The Models page
   provider directory, the Plugins configuration cards, and the
   Language/Appearance rows therefore work remotely.
+- **Older DSH builds also pin selected `/api/*` methods to loopback inside
+  the connection gateway.** The host half registers exact routes for those
+  method paths (`settings.*`, `credentials.*`, selected `agentPreset.*`,
+  `host.*`, and `llm.discoverModels`) so the webserver's original `/api`
+  prefix route is not duplicated. Each exact route applies this plugin's
+  same Host/Origin fence, calls the public `ctx.apiProxy` method, and
+  returns the normal `server-response` envelope. Ordinary `/api/*` calls
+  keep using the harness connection gateway.
 - **The client `settingsScope` degrades to memory mode on non-loopback
   origins** (surfaces render empty). The browser bundle widens
   `connection.isLoopback` to "loopback OR served LAN authority" at runtime.
@@ -112,12 +120,6 @@ modification of the DSH checkout**:
   configuration cards render nothing.)
 - **`crypto.randomUUID` does not exist on plain-HTTP LAN origins.** The
   bundle installs a `getRandomValues`-based polyfill (same CSPRNG).
-
-Remaining loopback-only (hardcoded in the harness, not patchable from a
-plugin): `host.pickDirectory` / `host.openPath` (native dialogs and host
-file opens) and `llm.discoverModels` (the Models page "discover" button).
-The workspace's own add/browse flow does not need them, and chat file
-opens route into the sidebar editor.
 
 ## Debug aids
 

@@ -59,6 +59,37 @@ export interface LanAccessWebServer {
   }): () => void
 }
 
+/** One API request object passed to ctx.apiProxy domain methods. */
+interface LanAccessApiRequest {
+  rpcId: string
+  payload: unknown
+}
+
+/** One API result slot returned by ctx.apiProxy domain methods. */
+type LanAccessApiResult =
+  | { ok: true; value: unknown }
+  | { ok: false; error: { code: string; message: string; details: Record<string, unknown> } }
+
+/** One narrow response returned by ctx.apiProxy domain methods. */
+interface LanAccessApiResponse {
+  rpcId: string
+  result: LanAccessApiResult
+}
+
+type LanAccessApiMethod = (
+  request: LanAccessApiRequest,
+  signal?: AbortSignal,
+) => Promise<LanAccessApiResponse>
+
+/** The apiProxy service face used by the exact privileged /api routes. */
+interface LanAccessApiProxy {
+  agentPresets: Record<'read' | 'copy' | 'openDocument' | 'remove', LanAccessApiMethod>
+  host: Record<'pickDirectory' | 'openPath', LanAccessApiMethod>
+  settings: Record<'describe' | 'openDocument' | 'update' | 'replace' | 'mutate', LanAccessApiMethod>
+  credentials: Record<'describe' | 'set' | 'unset', LanAccessApiMethod>
+  llm: Record<'discoverModels', LanAccessApiMethod>
+}
+
 /** One loader entry slice this plugin reads (the connection row's config). */
 export interface LanAccessLoaderEntry {
   /** Fully-qualified entry id (group-prefixed; the address for loader.update). */
@@ -78,6 +109,7 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     loader: LanAccessLoader
     webServer: LanAccessWebServer
+    apiProxy: LanAccessApiProxy
     /** The live bind-host source the webserver row's `host` expression reads. */
     lanAccess: LanAccessBindService
   }
@@ -109,6 +141,67 @@ const CONNECTION_ROW = '@deepseek-ai/dsh-client-connection'
 
 /** Request-body size bound of the POST write (defense against unbounded reads). */
 const MAX_BODY_BYTES = 64 * 1024
+
+/** Request-body size bound for exact /api privileged-route proxying. */
+const MAX_API_BODY_BYTES = 160 * 1024 * 1024
+
+/** Methods whose npm connection gateway pins to loopback on older dsh builds. */
+const PRIVILEGED_API_METHODS = [
+  'agentPreset.read',
+  'agentPreset.copy',
+  'agentPreset.openDocument',
+  'agentPreset.remove',
+  'host.pickDirectory',
+  'host.openPath',
+  'settings.describe',
+  'settings.openDocument',
+  'settings.update',
+  'settings.replace',
+  'settings.mutate',
+  'credentials.describe',
+  'credentials.set',
+  'credentials.unset',
+  'llm.discoverModels',
+] as const
+
+type PrivilegedApiMethod = typeof PRIVILEGED_API_METHODS[number]
+
+const PRIVILEGED_API_DISPATCH: Record<
+  PrivilegedApiMethod,
+  (api: LanAccessApiProxy, request: LanAccessApiRequest, signal: AbortSignal) => Promise<LanAccessApiResponse>
+> = {
+  'agentPreset.read': (api, request, signal) => api.agentPresets.read(request, signal),
+  'agentPreset.copy': (api, request, signal) => api.agentPresets.copy(request, signal),
+  'agentPreset.openDocument': (api, request, signal) => api.agentPresets.openDocument(request, signal),
+  'agentPreset.remove': (api, request, signal) => api.agentPresets.remove(request, signal),
+  'host.pickDirectory': (api, request, signal) => api.host.pickDirectory(request, signal),
+  'host.openPath': (api, request, signal) => api.host.openPath(request, signal),
+  'settings.describe': (api, request, signal) => api.settings.describe(request, signal),
+  'settings.openDocument': (api, request, signal) => api.settings.openDocument(request, signal),
+  'settings.update': (api, request, signal) => api.settings.update(request, signal),
+  'settings.replace': (api, request, signal) => api.settings.replace(request, signal),
+  'settings.mutate': (api, request, signal) => api.settings.mutate(request, signal),
+  'credentials.describe': (api, request, signal) => api.credentials.describe(request, signal),
+  'credentials.set': (api, request, signal) => api.credentials.set(request, signal),
+  'credentials.unset': (api, request, signal) => api.credentials.unset(request, signal),
+  'llm.discoverModels': (api, request, signal) => api.llm.discoverModels(request, signal),
+}
+
+const PRIVILEGED_API_METHOD_SET = new Set<string>(PRIVILEGED_API_METHODS)
+const INVALID_API_RPC_ID = 'invalid-request'
+
+interface LanAccessClientApiRequest {
+  type: 'client-request'
+  rpcId: string
+  method: string
+  payload: unknown
+}
+
+interface LanAccessServerApiResponse {
+  type: 'server-response'
+  rpcId: string
+  result: LanAccessApiResult
+}
 
 /** An HTTP failure with a wire code and status. */
 class LanAccessHttpError extends Error {
@@ -314,6 +407,20 @@ function trustedHostsOf(loader: LanAccessLoader): string[] {
   return []
 }
 
+function objectConfig(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
 /** Read a bounded JSON request body. */
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = []
@@ -342,6 +449,119 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
   } catch {
     /* the request already dropped (webserver restart) — nothing to answer */
   }
+}
+
+/** Read a bounded raw request body for /api proxying. */
+async function readRawBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of req) {
+    const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : chunk
+    total += buffer.length
+    if (total > maxBytes) {
+      throw new LanAccessHttpError('payload-too-large', 'request body too large', 413)
+    }
+    chunks.push(buffer)
+  }
+  return Buffer.concat(chunks)
+}
+
+function badApiResponse(
+  rpcId: string,
+  message: string,
+  details: Record<string, unknown> = { issues: [] },
+): LanAccessServerApiResponse {
+  return {
+    type: 'server-response',
+    rpcId,
+    result: { ok: false, error: { code: 'bad-request', message, details } },
+  }
+}
+
+function fullApiResponse(response: LanAccessApiResponse): LanAccessServerApiResponse {
+  return { type: 'server-response', rpcId: response.rpcId, result: response.result }
+}
+
+function apiMethodFromPath(pathname: string): PrivilegedApiMethod | undefined {
+  if (!pathname.startsWith('/api/')) return undefined
+  const method = pathname.slice('/api/'.length)
+  return PRIVILEGED_API_METHOD_SET.has(method) ? method as PrivilegedApiMethod : undefined
+}
+
+function clientApiRequestOf(value: unknown): LanAccessClientApiRequest | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  if (record.type !== 'client-request' || typeof record.rpcId !== 'string' || typeof record.method !== 'string') {
+    return undefined
+  }
+  return {
+    type: 'client-request',
+    rpcId: record.rpcId,
+    method: record.method,
+    payload: record.payload,
+  }
+}
+
+async function proxyApiRequest(
+  ctx: Context,
+  req: IncomingMessage,
+  res: ServerResponse,
+  trustedHosts: readonly string[],
+): Promise<void> {
+  if (!isTrustedApiRequest(req, trustedHosts)) {
+    res.writeHead(403)
+    res.end('forbidden')
+    return
+  }
+  if (req.method !== 'POST') {
+    res.writeHead(404)
+    res.end('not found')
+    return
+  }
+  const method = apiMethodFromPath(new URL(req.url ?? '/', 'http://dsh.internal').pathname)
+  if (method === undefined) {
+    res.writeHead(404)
+    res.end('not found')
+    return
+  }
+  const mediaType = header(req.headers, 'content-type')?.split(';', 1)[0]?.trim().toLowerCase()
+  if (mediaType !== 'application/json') {
+    res.writeHead(415)
+    res.end('content type must be application/json')
+    return
+  }
+  const apiProxy = ctx.get('apiProxy') as LanAccessApiProxy | undefined
+  if (apiProxy === undefined) {
+    res.writeHead(404)
+    res.end('not found')
+    return
+  }
+  let body: unknown
+  try {
+    body = JSON.parse((await readRawBody(req, MAX_API_BODY_BYTES)).toString('utf8'))
+  } catch {
+    res.writeHead(400)
+    res.end('body is not JSON')
+    return
+  }
+  const message = clientApiRequestOf(body)
+  if (message === undefined) {
+    writeJson(res, 200, badApiResponse(INVALID_API_RPC_ID, 'invalid client-request message'))
+    return
+  }
+  if (message.method !== method) {
+    writeJson(res, 200, badApiResponse(message.rpcId, `method ${JSON.stringify(message.method)} does not match endpoint ${JSON.stringify(method)}`))
+    return
+  }
+  const abort = new AbortController()
+  res.on('close', () => {
+    if (!res.writableEnded) abort.abort()
+  })
+  writeJson(res, 200, fullApiResponse(await PRIVILEGED_API_DISPATCH[method](
+    apiProxy,
+    { rpcId: message.rpcId, payload: message.payload },
+    abort.signal,
+  )))
 }
 
 /* ── settings/credentials RPC proxy ───────────────────────────────────────
@@ -580,12 +800,12 @@ async function dispatchLanAccessRpc(ctx: Context, method: string, payload: unkno
 /** The /lan-access/rpc route handler: fenced, POST-only, envelope-mirroring. */
 async function handleRpc(
   ctx: Context,
-  loader: LanAccessLoader,
+  trustedHosts: readonly string[],
   req: IncomingMessage,
   res: ServerResponse,
   log?: (method: string, ok: boolean, code?: string, ns?: string, namespaces?: string[]) => void,
 ): Promise<void> {
-  if (!isTrustedApiRequest(req, trustedHostsOf(loader))) {
+  if (!isTrustedApiRequest(req, trustedHosts)) {
     writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'request origin is not trusted' } })
     return
   }
@@ -671,37 +891,41 @@ export function apply(ctx: Context): void {
     return undefined
   }
 
-  /** Queue one bind convergence; no-ops when the webserver already binds the desired host. */
+  /** Trust the live LAN literals on older connection builds whose webRuntime value stays stale. */
+  const updateConnectionTrustedHosts = async (enabled: boolean): Promise<void> => {
+    const entry = connectionEntry()
+    if (entry === undefined) return
+    const currentConfig = objectConfig(entry.options.config)
+    const currentHosts = stringArray(currentConfig.trustedHosts)
+    const addresses = lanAddresses()
+    const nextHosts = enabled
+      ? [...new Set([...currentHosts, ...addresses])]
+      : currentHosts.filter(host => !addresses.includes(host))
+    if (sameStrings(currentHosts, nextHosts)) return
+    await loader.update(entry.id, { config: { ...currentConfig, trustedHosts: nextHosts } })
+  }
+
+  const routeTrustedHosts = (): string[] => {
+    const configured = trustedHostsOf(loader)
+    if (scope?.get().enabled !== true && serverOf()?.host !== '0.0.0.0') return configured
+    return [...new Set([...configured, ...lanAddresses()])]
+  }
+
+  /** Queue one bind convergence and keep the connection trust list in sync. */
   const enqueueApply = (enabled: boolean): Promise<void> => {
     pendingCount += 1
     const task = applying.then(async () => {
       const server = serverOf()
       if (server === undefined) return
       const desiredHost: LanAccessHost = enabled ? '0.0.0.0' : '127.0.0.1'
-      if (server.host === desiredHost) return
-      const entry = webserverEntry()
-      if (entry === undefined) {
-        throw new Error('webserver loader entry not found')
-      }
-      await loader.update(entry.id, { config: { host: desiredHost, port: server.port } })
-
-      // After rebinding to 0.0.0.0, patch the connection row's trustedHosts
-      // to include every LAN address. The upstream resolveLanTrust skips LAN
-      // detection when the server initially binds loopback, so the cascade
-      // alone never populates the list. Writing the resolved addresses into
-      // the connection config forces the /api fence to admit LAN clients.
-      if (enabled) {
-        const addresses = lanAddresses()
-        const connEntry = connectionEntry()
-        if (connEntry !== undefined) {
-          const currentConfig = (connEntry.options.config ?? {}) as Record<string, unknown>
-          const currentHosts = Array.isArray(currentConfig.trustedHosts)
-            ? currentConfig.trustedHosts as string[]
-            : []
-          const merged = [...new Set([...currentHosts, ...addresses])]
-          await loader.update(connEntry.id, { config: { ...currentConfig, trustedHosts: merged } })
+      if (server.host !== desiredHost) {
+        const entry = webserverEntry()
+        if (entry === undefined) {
+          throw new Error('webserver loader entry not found')
         }
+        await loader.update(entry.id, { config: { host: desiredHost, port: server.port } })
       }
+      await updateConnectionTrustedHosts(enabled)
     })
     applying = task.catch(() => {})
     void task.finally(() => { pendingCount -= 1 }).catch(() => {})
@@ -771,7 +995,7 @@ export function apply(ctx: Context): void {
       kind: 'exact',
       path: '/lan-access/rpc',
       handler: (req, res) => {
-        void handleRpc(ctx, loader, req, res, (method, ok, code, ns, namespaces) => logRpc(method, ok, code, ns, namespaces)).catch((error: unknown) => {
+        void handleRpc(ctx, routeTrustedHosts(), req, res, (method, ok, code, ns, namespaces) => logRpc(method, ok, code, ns, namespaces)).catch((error: unknown) => {
           writeJson(res, 500, {
             ok: false,
             error: { code: 'internal', message: error instanceof Error ? error.message : String(error) },
@@ -780,6 +1004,25 @@ export function apply(ctx: Context): void {
       },
     }), 'dsh-lan-access: /lan-access/rpc route')
 
+    for (const method of PRIVILEGED_API_METHODS) {
+      httpCtx.effect(() => httpCtx.webServer.register({
+        kind: 'exact',
+        path: `/api/${method}`,
+        handler: (req, res) => {
+          void proxyApiRequest(ctx, req, res, routeTrustedHosts()).catch((error: unknown) => {
+            if (error instanceof LanAccessHttpError) {
+              writeJson(res, error.status, { ok: false, error: { code: error.code, message: error.message } })
+              return
+            }
+            writeJson(res, 500, {
+              ok: false,
+              error: { code: 'internal', message: error instanceof Error ? error.message : String(error) },
+            })
+          })
+        },
+      }), `dsh-lan-access: /api/${method} privileged route`)
+    }
+
     // Client boot diagnostics: browsers POST their ledger state after boot;
     // GET reads the last reports (debug aid for LAN settings issues).
     httpCtx.effect(() => httpCtx.webServer.register({
@@ -787,7 +1030,7 @@ export function apply(ctx: Context): void {
       path: '/lan-access/diag',
       handler: (req, res) => {
         void (async () => {
-          if (!isTrustedApiRequest(req, trustedHostsOf(loader))) {
+          if (!isTrustedApiRequest(req, routeTrustedHosts())) {
             writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'request origin is not trusted' } })
             return
           }
@@ -817,7 +1060,7 @@ export function apply(ctx: Context): void {
       writeJson(res, 404, { ok: false, error: { code: 'not-found', message: 'not found' } })
       return
     }
-    if (!isTrustedApiRequest(req, trustedHostsOf(loader))) {
+    if (!isTrustedApiRequest(req, routeTrustedHosts())) {
       writeJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'request origin is not trusted' } })
       return
     }
