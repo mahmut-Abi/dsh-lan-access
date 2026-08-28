@@ -67,6 +67,26 @@ fence all ship inside the plugin.
 > override from the profile's `cordis.patch.yml` (and the bundle patch layers)
 > so the plugin is the single owner of the bind host.
 
+## Deployment configuration
+
+The plugin accepts deployment-local authorities for Docker and reverse-proxy
+setups whose browser URL is not one of the container's own NIC addresses:
+
+```yaml
+- id: lan-access
+  name: dsh-lan-access
+  config:
+    publicHost: 192.168.0.101
+    trustedHosts:
+      - dsh.example.internal
+```
+
+`publicHost` is the host[:port] shown by the settings row and trusted by the
+plugin routes. `trustedHosts` adds more Host authorities accepted by the same
+fence. The package's `cordis.patch.yml` also reads `DSH_PUBLIC_HOST`,
+`LAN_IP`, and `DSH_TRUSTED_HOSTS` (comma- or space-separated) for container
+images that inject those values at process start.
+
 ## Use
 
 1. Open the GUI, go to **Settings** (sidebar footer) → **General**.

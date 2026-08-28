@@ -46,6 +46,20 @@ export const LanAccessSchema: z<LanAccessSettings> = z.object({
   enabled: z.boolean().default(false),
 })
 
+/** Deployment-local host authorities the plugin should trust and advertise. */
+export interface Config {
+  /** Extra browser Host authorities accepted by the LAN access routes. */
+  trustedHosts?: string[]
+  /** Preferred public host[:port] shown in the settings row. */
+  publicHost?: string
+}
+
+/** Validate and default deployment-local LAN access configuration. */
+export const Config: z<Config> = z.object({
+  trustedHosts: z.array(z.string()).default([]),
+  publicHost: z.string().default(''),
+})
+
 /** One webserver service slice this plugin reads. */
 export interface LanAccessWebServer {
   readonly host: LanAccessHost
@@ -350,6 +364,12 @@ function isTrustedAuthority(hostUrl: URL, trustedHosts: readonly string[]): bool
   })
 }
 
+function assertTrustedAuthority(entry: string): void {
+  const entryUrl = parseAuthority(entry)
+  if (entryUrl !== undefined && canonicalAuthority(entry, entryUrl) === entry.toLowerCase()) return
+  throw new Error(`dsh-lan-access: trustedHosts entry ${JSON.stringify(entry)} is not a bare host[:port] authority`)
+}
+
 /** Decide whether one request may reach the plugin route. */
 function isTrustedApiRequest(req: IncomingMessage, trustedHosts: readonly string[]): boolean {
   const host = header(req.headers, 'host')
@@ -417,6 +437,25 @@ function stringArray(value: unknown): string[] {
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function uniqueHosts(hosts: readonly string[]): string[] {
+  return [...new Set(hosts.filter(host => host !== ''))]
+}
+
+function configuredHosts(config: Config): string[] {
+  const hosts = [...(config.trustedHosts ?? [])]
+  if (config.publicHost !== undefined && config.publicHost !== '') hosts.push(config.publicHost)
+  for (const host of hosts) assertTrustedAuthority(host)
+  return uniqueHosts(hosts)
+}
+
+function displayAuthority(publicHost: string | undefined, fallbackHost: string | undefined, port: number): string | undefined {
+  const host = publicHost !== undefined && publicHost !== '' ? publicHost : fallbackHost
+  if (host === undefined) return undefined
+  const url = parseAuthority(host)
+  if (url === undefined) return undefined
+  return url.port === '' ? `${url.hostname}:${String(port)}` : url.host
 }
 
 /** Read a bounded JSON request body. */
@@ -839,8 +878,10 @@ async function handleRpc(
 /**
  * Mount the LAN-access controller.
  * @param ctx - host context (loader injected).
+ * @param config - deployment-local public Host authorities.
  */
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config: Config = {}): void {
+  const explicitHosts = configuredHosts(config)
   const loader = ctx.loader
   const ns = settingsNamespace(LAN_ACCESS_NAMESPACE)
   const scope = ctx.settings.register<LanAccessSettings>(ns, LanAccessSchema)
@@ -897,15 +938,16 @@ export function apply(ctx: Context): void {
     const currentConfig = objectConfig(entry.options.config)
     const currentHosts = stringArray(currentConfig.trustedHosts)
     const addresses = lanAddresses()
+    const baseHosts = uniqueHosts([...currentHosts.filter(host => !addresses.includes(host)), ...explicitHosts])
     const nextHosts = enabled
-      ? [...new Set([...currentHosts, ...addresses])]
-      : currentHosts.filter(host => !addresses.includes(host))
+      ? uniqueHosts([...baseHosts, ...addresses])
+      : baseHosts
     if (sameStrings(currentHosts, nextHosts)) return
     await loader.update(entry.id, { config: { ...currentConfig, trustedHosts: nextHosts } })
   }
 
   const routeTrustedHosts = (): string[] => {
-    const configured = trustedHostsOf(loader)
+    const configured = uniqueHosts([...trustedHostsOf(loader), ...explicitHosts])
     if (scope.get().enabled !== true && serverOf()?.host !== '0.0.0.0') return configured
     return [...new Set([...configured, ...lanAddresses()])]
   }
@@ -950,6 +992,9 @@ export function apply(ctx: Context): void {
     const enabled = scope.get().enabled
     const addresses = enabled ? lanAddresses() : []
     const primary = enabled ? await primaryLanAddress() : undefined
+    const authority = server === undefined || !enabled
+      ? undefined
+      : displayAuthority(config.publicHost, primary, server.port)
     return {
       ready: server !== undefined,
       enabled,
@@ -957,9 +1002,7 @@ export function apply(ctx: Context): void {
       port: server?.port ?? null,
       pending: pendingCount > 0,
       addresses,
-      url: primary !== undefined && server !== undefined
-        ? `http://${primary}:${server.port}`
-        : null,
+      url: authority !== undefined ? `http://${authority}` : null,
     }
   }
 

@@ -9,10 +9,17 @@
 # profile boot merges THIS patch (an insert of the host row plus a webserver
 # config override) like any manual cordis.patch.yml mount line.
 
-# The host row.
+# The host row. Docker deployments may pass DSH_PUBLIC_HOST and
+# DSH_TRUSTED_HOSTS so bridge/port-mapped containers can trust the external
+# authority that browsers actually use.
 - insert:
     - id: lan-access
       name: 'dsh-lan-access'
+      config:
+        trustedHosts: !!js >-
+          (process.env.DSH_TRUSTED_HOSTS ?? '').split(/[\s,]+/u).filter(Boolean)
+        publicHost: !!js >-
+          process.env.DSH_PUBLIC_HOST || process.env.LAN_IP || ''
 
 # The webserver bind host follows the plugin's persisted setting. The row
 # waits for the `lanAccess` service before the first bind, so enabled profiles
